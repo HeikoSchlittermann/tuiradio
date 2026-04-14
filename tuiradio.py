@@ -1,0 +1,477 @@
+#!/usr/bin/env python3
+# SPDX-License-Identifier: GPL-3.0-or-later
+# Copyright (C) 2026 surrogard
+"""tuiradio – A TUI internet radio player backed by the Radio Browser API."""
+
+import json
+import os
+import pathlib
+import re
+import socket
+import subprocess
+from typing import NamedTuple, Optional
+
+import httpx
+from textual.app import App, ComposeResult
+from textual.binding import Binding
+from textual.containers import Vertical
+from textual.widgets import DataTable, Footer, Header, Input, Static
+from textual import on, work
+
+RADIO_API = "https://de1.api.radio-browser.info/json"
+_HEADERS = {"User-Agent": "tuiradio/1.0"}
+CONFIG_PATH = pathlib.Path.home() / ".config" / "tuiradio" / "config.json"
+
+
+# ── search query parser ──────────────────────────────────────────────────────
+
+class _Parsed(NamedTuple):
+    api_params: dict
+    exclude_tags: list    # lowercased tag values for NOT tag:
+    exclude_fields: list  # list of (station_key, value) for NOT country:/codec:/language:
+
+
+_TOKEN_RE = re.compile(r'(NOT\s+)?(\w+):(\S+)', re.IGNORECASE)
+
+_PREFIX_MAP = {
+    "tag": "tag", "tags": "tag",
+    "country": "countrycode",
+    "codec": "codec",
+    "language": "language",
+    "bitrate": "bitrate",
+}
+
+
+def _parse_query(query: str) -> _Parsed:
+    api_params: dict = {}
+    exclude_tags: list = []
+    exclude_fields: list = []
+    positive_tags: list = []
+    remainder = query
+
+    for m in _TOKEN_RE.finditer(query):
+        is_not = bool(m.group(1))
+        prefix = m.group(2).lower()
+        value  = m.group(3)
+        canon  = _PREFIX_MAP.get(prefix)
+
+        if canon is None:
+            continue  # unknown prefix — leave in remainder for name=
+
+        remainder = remainder.replace(m.group(0), "", 1)
+
+        if canon == "tag":
+            if is_not:
+                exclude_tags.append(value.lower())
+            else:
+                positive_tags.append(value.lower())
+        elif canon == "bitrate":
+            if not is_not:
+                parts = value.split("-")
+                try:
+                    if parts[0]:
+                        api_params["bitrateMin"] = int(parts[0])
+                    if len(parts) == 2 and parts[1]:
+                        api_params["bitrateMax"] = int(parts[1])
+                except ValueError:
+                    pass
+        elif canon == "countrycode":
+            if is_not:
+                exclude_fields.append(("countrycode", value.upper()))
+            else:
+                api_params["countrycode"] = value.upper()
+        else:  # codec, language
+            if is_not:
+                exclude_fields.append((canon, value.lower()))
+            else:
+                api_params[canon] = value
+
+    if positive_tags:
+        api_params["tagList"] = ",".join(dict.fromkeys(positive_tags))
+
+    name = re.sub(r'\bAND\b', '', remainder, flags=re.IGNORECASE).strip()
+    if name:
+        api_params["name"] = name
+
+    return _Parsed(api_params, exclude_tags, exclude_fields)
+
+
+def _apply_filters(stations: list[dict], parsed: _Parsed) -> list[dict]:
+    if not parsed.exclude_tags and not parsed.exclude_fields:
+        return stations
+    result = []
+    for s in stations:
+        station_tags = {t.strip().lower() for t in (s.get("tags") or "").split(",")}
+        if any(t in station_tags for t in parsed.exclude_tags):
+            continue
+        if any((s.get(key) or "").lower() == val for key, val in parsed.exclude_fields):
+            continue
+        result.append(s)
+    return result
+
+
+class TuiRadio(App):
+    """Terminal UI internet radio player."""
+
+    CSS = """
+    Screen { layout: vertical; }
+
+    #search-row {
+        height: 3;
+        padding: 0 1;
+        background: $panel;
+    }
+
+    #stations { height: 1fr; }
+
+    #status {
+        height: 1;
+        padding: 0 1;
+        background: $panel;
+        color: $text-muted;
+    }
+    #status.playing { color: $success; }
+    """
+
+    BINDINGS = [
+        Binding("ctrl+l", "focus_search", "Search"),
+        Binding("+", "volume_up", "Vol +"),
+        Binding("=", "volume_up", "Vol +", show=False),
+        Binding("-", "volume_down", "Vol -"),
+        Binding("s", "stop", "Stop"),
+        Binding("q", "quit", "Quit"),
+        Binding("r", "reload", "Top stations"),
+    ]
+
+    def __init__(self) -> None:
+        super().__init__()
+        self._player: Optional[subprocess.Popen] = None
+        self._stations: list[dict] = []
+        self._current: Optional[dict] = None
+        self._volume: int = 100
+        self._ipc_path: str = f"/tmp/tuiradio-{os.getpid()}.sock"
+        self._watching: bool = False
+        self._song_title: str = ""
+        self._last_station_uuid: str = ""
+        self._last_search: str = ""
+        self._load_config()
+
+    # ── config persistence ───────────────────────────────────────────────
+
+    def _load_config(self) -> None:
+        try:
+            data = json.loads(CONFIG_PATH.read_text())
+            self._volume = int(data.get("volume", 100))
+            self._last_station_uuid = data.get("last_station_uuid", "")
+            self._last_search = data.get("last_search", "")
+        except Exception:
+            pass
+
+    def _save_config(self) -> None:
+        try:
+            CONFIG_PATH.parent.mkdir(parents=True, exist_ok=True)
+            CONFIG_PATH.write_text(
+                json.dumps({
+                    "volume": self._volume,
+                    "last_station_uuid": self._last_station_uuid,
+                    "last_search": self._last_search,
+                }, indent=2)
+            )
+        except Exception:
+            pass
+
+    # ── layout ──────────────────────────────────────────────────────────
+
+    def compose(self) -> ComposeResult:
+        yield Header(show_clock=True)
+        with Vertical(id="search-row"):
+            yield Input(
+                placeholder="Search: name  or  tag:rock country:DE codec:mp3 NOT tag:pop  (Ctrl+L to focus)",
+                id="search",
+            )
+        yield DataTable(id="stations", cursor_type="row")
+        yield Static("", id="status")
+        yield Footer()
+
+    def on_mount(self) -> None:
+        self._rebuild_columns()
+        search_input = self.query_one("#search", Input)
+        if self._last_search:
+            search_input.value = self._last_search
+            self._fetch_search(self._last_search)
+        else:
+            self._fetch_top()
+
+    def on_resize(self) -> None:
+        self._rebuild_columns()
+        if self._stations:
+            self._populate(self._stations)
+
+    # ── column helpers ───────────────────────────────────────────────────
+
+    def _name_col_width(self) -> int:
+        # Fixed cols: Country(7) + Tags(20) + Bitrate(8) + Codec(5)
+        #           + Votes(7) + Clicks(7) = 54
+        # ~12 chars for DataTable cell padding and borders across 7 columns
+        return max(20, self.size.width - 54 - 16)
+
+    def _rebuild_columns(self) -> None:
+        t = self.query_one("#stations", DataTable)
+        t.clear(columns=True)
+        t.add_column("Name", width=self._name_col_width())
+        t.add_column("Country", width=7)
+        t.add_column("Tags", width=20)
+        t.add_column("Bitrate", width=8)
+        t.add_column("Codec", width=5)
+        t.add_column("Votes", width=7)
+        t.add_column("Clicks", width=7)
+
+    # ── workers (run in background threads) ─────────────────────────────
+
+    @work(exclusive=True, thread=True)
+    def _fetch_top(self) -> None:
+        self.call_from_thread(self._set_status, "Loading top stations…")
+        try:
+            with httpx.Client(timeout=10) as c:
+                r = c.get(
+                    f"{RADIO_API}/stations/topvote",
+                    params={"limit": 100, "hidebroken": "true"},
+                    headers=_HEADERS,
+                )
+                r.raise_for_status()
+                self.call_from_thread(self._populate, r.json())
+        except Exception as exc:
+            self.call_from_thread(self._set_status, f"Error loading stations: {exc}")
+
+    @work(exclusive=True, thread=True)
+    def _fetch_search(self, query: str) -> None:
+        self.call_from_thread(self._set_status, f'Searching for "{query}"…')
+        parsed = _parse_query(query)
+        if not parsed.api_params:
+            self.call_from_thread(self._fetch_top)
+            return
+        try:
+            with httpx.Client(timeout=10) as c:
+                r = c.get(
+                    f"{RADIO_API}/stations/search",
+                    params={
+                        **parsed.api_params,
+                        "limit": 100,
+                        "hidebroken": "true",
+                        "order": "votes",
+                        "reverse": "true",
+                    },
+                    headers=_HEADERS,
+                )
+                r.raise_for_status()
+                stations = _apply_filters(r.json(), parsed)
+                self.call_from_thread(self._populate, stations)
+        except Exception as exc:
+            self.call_from_thread(self._set_status, f"Search error: {exc}")
+
+    # ── UI helpers ───────────────────────────────────────────────────────
+
+    def _populate(self, data: list[dict]) -> None:
+        self._stations = data
+        t = self.query_one("#stations", DataTable)
+        t.clear()
+        for s in data:
+            bitrate = f"{s['bitrate']}k" if s.get("bitrate") else "—"
+            tags = (s.get("tags") or "")[:20]
+            name = (s.get("name") or "")[:self._name_col_width()]
+            votes = str(s.get("votes") or 0)
+            clicks = str(s.get("clickcount") or 0)
+            t.add_row(
+                name,
+                s.get("countrycode", ""),
+                tags,
+                bitrate,
+                s.get("codec", ""),
+                votes,
+                clicks,
+            )
+        self._set_status(f"{len(data)} stations  •  ↑↓ navigate  •  Enter to play")
+        # Restore cursor to last listened station
+        if self._last_station_uuid:
+            for idx, s in enumerate(data):
+                if s.get("stationuuid") == self._last_station_uuid:
+                    t.move_cursor(row=idx)
+                    break
+
+    def _set_status(self, msg: str) -> None:
+        bar = self.query_one("#status", Static)
+        if self._current:
+            bar.update(f"▶  {self._current['name']}   │   vol: {self._volume}%   │   {msg}")
+            bar.add_class("playing")
+        else:
+            bar.update(msg)
+            bar.remove_class("playing")
+
+    # ── playback ─────────────────────────────────────────────────────────
+
+    @work(exclusive=False, thread=True)
+    def _notify_click(self, uuid: str) -> None:
+        """Tell Radio Browser a station was played (community courtesy)."""
+        if not uuid:
+            return
+        try:
+            with httpx.Client(timeout=5) as c:
+                c.get(f"{RADIO_API}/url/{uuid}", headers=_HEADERS)
+        except Exception:
+            pass
+
+    def _play(self, station: dict) -> None:
+        self._stop_player()
+        url = station.get("url_resolved") or station.get("url", "")
+        if not url:
+            self._set_status("No stream URL available for this station")
+            return
+        self._current = station
+        self._last_station_uuid = station.get("stationuuid", "")
+        self._song_title = ""
+        self._notify_click(self._last_station_uuid)
+        try:
+            self._player = subprocess.Popen(
+                [
+                    "mpv", "--no-video", "--no-terminal",
+                    f"--volume={self._volume}",
+                    f"--input-ipc-server={self._ipc_path}",
+                    url,
+                ],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+            self._watching = True
+            self._track_song_title()
+            self._set_status("Connecting…")
+        except FileNotFoundError:
+            self._set_status("mpv not found — install with: sudo pacman -S mpv")
+        except Exception as exc:
+            self._set_status(f"Playback error: {exc}")
+
+    def _mpv_cmd(self, *args) -> None:
+        """Send a JSON IPC command to the running mpv process."""
+        try:
+            with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as s:
+                s.settimeout(1)
+                s.connect(self._ipc_path)
+                s.sendall(json.dumps({"command": list(args)}).encode() + b"\n")
+        except Exception:
+            pass
+
+    @work(exclusive=False, thread=True)
+    def _track_song_title(self) -> None:
+        """Keep a persistent IPC connection and stream media-title changes."""
+        import time
+        # Wait up to 2 s for mpv to create the socket.
+        for _ in range(20):
+            if os.path.exists(self._ipc_path):
+                break
+            time.sleep(0.1)
+        else:
+            return
+        try:
+            with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as s:
+                s.settimeout(2)
+                s.connect(self._ipc_path)
+                s.sendall(
+                    json.dumps({"command": ["observe_property", 1, "media-title"]}).encode()
+                    + b"\n"
+                )
+                buf = b""
+                while self._watching:
+                    try:
+                        s.settimeout(1)
+                        chunk = s.recv(4096)
+                    except socket.timeout:
+                        continue
+                    except OSError:
+                        break
+                    if not chunk:
+                        break
+                    buf += chunk
+                    while b"\n" in buf:
+                        line, buf = buf.split(b"\n", 1)
+                        try:
+                            msg = json.loads(line)
+                        except json.JSONDecodeError:
+                            continue
+                        if (
+                            msg.get("event") == "property-change"
+                            and msg.get("name") == "media-title"
+                        ):
+                            title = msg.get("data") or ""
+                            self.call_from_thread(self._update_song_title, title)
+        except Exception:
+            pass
+
+    def _update_song_title(self, title: str) -> None:
+        self._song_title = title
+        if title:
+            self._set_status(f"♪  {title}")
+        else:
+            self._set_status("Playing…")
+
+    def _stop_player(self) -> None:
+        self._watching = False
+        if self._player:
+            self._player.terminate()
+            try:
+                self._player.wait(timeout=2)
+            except subprocess.TimeoutExpired:
+                self._player.kill()
+            self._player = None
+        self._song_title = ""
+        try:
+            os.unlink(self._ipc_path)
+        except FileNotFoundError:
+            pass
+
+    # ── actions & events ─────────────────────────────────────────────────
+
+    def action_focus_search(self) -> None:
+        self.query_one("#search", Input).focus()
+
+    def action_volume_up(self) -> None:
+        self._volume = min(100, self._volume + 5)
+        self._mpv_cmd("set_property", "volume", self._volume)
+        self._set_status(f"Volume: {self._volume}%")
+
+    def action_volume_down(self) -> None:
+        self._volume = max(0, self._volume - 5)
+        self._mpv_cmd("set_property", "volume", self._volume)
+        self._set_status(f"Volume: {self._volume}%")
+
+    def action_stop(self) -> None:
+        self._stop_player()
+        self._current = None
+        self._set_status("Stopped")
+
+    def action_reload(self) -> None:
+        self.query_one("#search", Input).clear()
+        self._fetch_top()
+
+    def action_quit(self) -> None:
+        self._stop_player()
+        self._save_config()
+        self.exit()
+
+    @on(Input.Submitted, "#search")
+    def on_search_submit(self, event: Input.Submitted) -> None:
+        q = event.value.strip()
+        self._last_search = q
+        if q:
+            self._fetch_search(q)
+        else:
+            self._fetch_top()
+        self.query_one("#stations", DataTable).focus()
+
+    @on(DataTable.RowSelected, "#stations")
+    def on_row_selected(self, event: DataTable.RowSelected) -> None:
+        idx = event.cursor_row
+        if 0 <= idx < len(self._stations):
+            self._play(self._stations[idx])
+
+
+if __name__ == "__main__":
+    TuiRadio().run()
